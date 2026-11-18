@@ -1519,6 +1519,64 @@ private:
 	} modReadDescriptorPatch;
 	
 	/**
+	 *  A submodule to make display PLLs lock when they are programmed from scratch on Skylake/Kaby Lake
+	 *
+	 *  After S3/S4 the display PLLs are reset, so on wake the framebuffer has to program the PLL that drives
+	 *  an HDMI/DVI port itself (on a cold boot it inherits the PLL set up by the firmware). `EnableClocks`
+	 *  enables the PLL before writing DPLL_CFGCR1/2, which are zero after S3, and then only rewrites the
+	 *  enable bit while polling for lock for about 2 ms. The PLL starts with an empty configuration and never
+	 *  locks, DPLL_CTRL2 is never written, and enabling the transcoder/pipe on the unclocked DDI ends in an
+	 *  uncorrectable PCU machine check (IA32_MC4_STATUS 0xba00000011000402) and a hang on wake.
+	 *
+	 *  Linux (skl_ddi_pll_enable) programs DPLL_CTRL1 and CFGCR1/2 first, then enables the PLL and waits
+	 *  up to 5 ms for lock. This submodule restarts the PLL once its CFGCR2 has been written and waits for lock.
+	 */
+	class DPLLLockFix: public PatchSubmodule {
+		/**
+		 *  Register offsets (Skylake/Kaby Lake display engine)
+		 */
+		static constexpr uint32_t SKL_DPLL1_CTL   = 0x46014;  // LCPLL2_CTL
+		static constexpr uint32_t SKL_DPLL2_CTL   = 0x46040;  // WRPLL_CTL1
+		static constexpr uint32_t SKL_DPLL3_CTL   = 0x46060;  // WRPLL_CTL2
+		static constexpr uint32_t SKL_DPLL1_CFGCR2 = 0x6C044;
+		static constexpr uint32_t SKL_DPLL2_CFGCR2 = 0x6C04C;
+		static constexpr uint32_t SKL_DPLL3_CFGCR2 = 0x6C054;
+		static constexpr uint32_t SKL_DPLL_STATUS = 0x6C060;
+		static constexpr uint32_t SKL_DPLL_ENABLE = 1U << 31;
+
+		/**
+		 *  Maximum time to wait for a PLL to lock, in microseconds (same as Linux)
+		 */
+		static constexpr uint32_t LockTimeout = 5000;
+
+		/**
+		 *  Replacer for writes to the DPLL1-3 enable registers: only the enable bit is meaningful on SKL/KBL
+		 */
+		static void wrapWriteRegisterDPLLEnable(void *controller, uint32_t address, uint32_t value);
+
+		/**
+		 *  Epilogue for writes to DPLL_CFGCR2 of DPLL1-3: restart the PLL with the complete configuration
+		 */
+		static void wrapWriteRegisterDPLLCfgcr2(void *controller, uint32_t address, uint32_t value);
+
+		/**
+		 *  Injection descriptors
+		 */
+		MMIOWriteInjectionDescriptor dDPLL1Enable {SKL_DPLL1_CTL, wrapWriteRegisterDPLLEnable};
+		MMIOWriteInjectionDescriptor dDPLL2Enable {SKL_DPLL2_CTL, wrapWriteRegisterDPLLEnable};
+		MMIOWriteInjectionDescriptor dDPLL3Enable {SKL_DPLL3_CTL, wrapWriteRegisterDPLLEnable};
+		MMIOWriteInjectionDescriptor dDPLL1Cfgcr2 {SKL_DPLL1_CFGCR2, wrapWriteRegisterDPLLCfgcr2};
+		MMIOWriteInjectionDescriptor dDPLL2Cfgcr2 {SKL_DPLL2_CFGCR2, wrapWriteRegisterDPLLCfgcr2};
+		MMIOWriteInjectionDescriptor dDPLL3Cfgcr2 {SKL_DPLL3_CFGCR2, wrapWriteRegisterDPLLCfgcr2};
+
+	public:
+		// MARK: Patch Submodule IMP
+		void init() override;
+		void processKernel(KernelPatcher &patcher, DeviceInfo *info) override;
+		void processFramebufferKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) override;
+	} modDPLLLockFix;
+
+	/**
 	 *  A submodule to patch backlight register values and thus avoid 3-minute black screen on KBL+
 	 *
 	 *  @note Supported Platforms: KBL, CFL, ICL.
@@ -2390,7 +2448,7 @@ private:
 	/**
 	 *  A collection of submodules
 	 */
-	PatchSubmodule *submodules[21] = {
+	PatchSubmodule *submodules[22] = {
 		&modDVMTCalcFix,
 		&modDPCDMaxLinkRateFix,
 		&modCoreDisplayClockFix,
@@ -2407,6 +2465,7 @@ private:
 		&modPAVPDisabler,
 		&modReadDescriptorPatch,
 		&modBacklightRegistersFix,
+		&modDPLLLockFix,
 		&modBacklightRegistersAltFix,
 		&modBacklightSmoother,
 		&modFramebufferDebugSupport,

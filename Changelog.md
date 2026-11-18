@@ -1,5 +1,8 @@
  WhateverGreen Changelog
 =======================
+#### v1.7.2
+- Added `-igfxdpllfix` (`enable-dpll-lock-fix` property) to fix a machine check hang on wake from sleep on SKL/KBL with HDMI/DVI displays, caused by display PLLs that are enabled before being configured and never lock
+
 #### v1.7.1
 - Added support for routing IOReg getProperty in other kexts
 

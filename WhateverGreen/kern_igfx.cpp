@@ -2175,3 +2175,80 @@ void IGFX::applyWestmereFeaturePatches(IOService *framebuffer) {
 	else
 		DBGLOG("igfx", "applyWestmereFeaturePatches failed %X", callbackIGFX->framebufferPatchFlags.value);
 }
+
+// MARK: - DPLL Lock Fix
+
+void IGFX::DPLLLockFix::init() {
+	// We only need to patch the framebuffer driver
+	requiresPatchingFramebuffer = true;
+
+	// We need R/W access to MMIO registers
+	requiresMMIORegistersReadAccess = true;
+	requiresMMIORegistersWriteAccess = true;
+}
+
+void IGFX::DPLLLockFix::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
+	auto generation = BaseDeviceInfo::get().cpuGeneration;
+	if (generation != CPUInfo::CpuGeneration::Skylake && generation != CPUInfo::CpuGeneration::KabyLake)
+		return;
+
+	enabled = checkKernelArgument("-igfxdpllfix");
+	if (!enabled)
+		enabled = info->videoBuiltin->getProperty("enable-dpll-lock-fix") != nullptr;
+}
+
+void IGFX::DPLLLockFix::processFramebufferKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	auto framebuffer = Value::of(callbackIGFX->getRealFramebuffer(index));
+	if (!framebuffer.isOneOf(&kextIntelSKLFb, &kextIntelKBLFb)) {
+		SYSLOG("igfx", "DPLL: Found an unsupported platform. Will not perform any injections.");
+		return;
+	}
+
+	auto &rws = callbackIGFX->modMMIORegistersWriteSupport;
+	rws.replacerList.add(&dDPLL1Enable);
+	rws.replacerList.add(&dDPLL2Enable);
+	rws.replacerList.add(&dDPLL3Enable);
+	rws.epilogueList.add(&dDPLL1Cfgcr2);
+	rws.epilogueList.add(&dDPLL2Cfgcr2);
+	rws.epilogueList.add(&dDPLL3Cfgcr2);
+	DBGLOG("igfx", "DPLL: Will make sure DPLL1-3 lock after being programmed from scratch.");
+}
+
+void IGFX::DPLLLockFix::wrapWriteRegisterDPLLEnable(void *controller, uint32_t address, uint32_t value) {
+	// Apple writes leftover WRPLL bits from older generations (e.g. 0x80202418). On SKL/KBL only the enable
+	// bit of LCPLL2_CTL/WRPLL_CTL1/WRPLL_CTL2 is meaningful, and Linux writes the enable bit alone.
+	if (value & SKL_DPLL_ENABLE)
+		value = SKL_DPLL_ENABLE;
+	callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32(controller, address, value);
+}
+
+void IGFX::DPLLLockFix::wrapWriteRegisterDPLLCfgcr2(void *controller, uint32_t address, uint32_t value) {
+	// The original write has already been performed (epilogue).
+	// DPLL1-3 use bits 8, 16 and 24 of DPLL_STATUS, CFGCR2 registers are 8 bytes apart.
+	auto pll = (address - SKL_DPLL1_CFGCR2) / 8 + 1;
+	auto ctl = pll == 1 ? SKL_DPLL1_CTL : (pll == 2 ? SKL_DPLL2_CTL : SKL_DPLL3_CTL);
+	auto lockBit = 1U << (pll * 8);
+
+	// Nothing to do if the PLL is off (it will be enabled with the right configuration) or already locked.
+	if (!(callbackIGFX->readRegister32(controller, ctl) & SKL_DPLL_ENABLE) ||
+		(callbackIGFX->readRegister32(controller, SKL_DPLL_STATUS) & lockBit))
+		return;
+
+	// The PLL was enabled before its configuration was complete: restart it now that CFGCR1/2 are valid.
+	auto &write = callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32;
+	write(controller, ctl, 0);
+	(void)callbackIGFX->readRegister32(controller, ctl);
+	IODelay(20);
+	write(controller, ctl, SKL_DPLL_ENABLE);
+
+	uint32_t waited = 0;
+	while (!(callbackIGFX->readRegister32(controller, SKL_DPLL_STATUS) & lockBit) && waited < LockTimeout) {
+		IODelay(10);
+		waited += 10;
+	}
+
+	if (callbackIGFX->readRegister32(controller, SKL_DPLL_STATUS) & lockBit)
+		DBGLOG("igfx", "DPLL: DPLL%u restarted and locked after %u us.", pll, waited);
+	else
+		SYSLOG("igfx", "DPLL: DPLL%u did not lock within %u us after a restart.", pll, LockTimeout);
+}
